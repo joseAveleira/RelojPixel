@@ -20,6 +20,8 @@
 
 </div>
 
+> 💖 **Agradecimientos Especiales**: Este proyecto tiene sus raíces en [dmdos.net](https://www.dmdos.net/). Un agradecimiento enorme también a [mortaca.com](https://www.mortaca.com/) por la placa que facilita increíblemente todo el montaje. Todo este proyecto salió de allí, ¡gracias!
+
 ---
 
 ## 🎯 ¿Qué es RelojPixel?
