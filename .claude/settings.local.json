@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio run:*)",
+      "Bash(git reset:*)",
+      "Bash(git branch:*)",
+      "Bash(ls:*)",
+      "Bash(cp:*)"
+    ]
+  }
+}
