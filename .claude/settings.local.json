@@ -5,7 +5,9 @@
       "Bash(git reset:*)",
       "Bash(git branch:*)",
       "Bash(ls:*)",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Bash(find /c/Users/josea/Documents/PlatformIO/Projects/RelojPixel -name IoTConnect* -type f)",
+      "Bash(~/.platformio/penv/Scripts/pio run:*)"
     ]
   }
 }

@@ -15,9 +15,10 @@
 #define AP_NAME   "PixelClock-Setup"
 #define APP_NAME  "PixelClock"
 
-// Configuración hora
-const long gmtOffset_sec = 3600;
-const int daylightOffset_sec = 3600;
+// Zona horaria por defecto: España (CET/CEST con cambio automático verano/invierno)
+// Se puede sobreescribir desde MQTT con utcOffset
+#define DEFAULT_TZ "CET-1CEST,M3.5.0,M10.5.0/3"
+long utcOffset_sec = 0; // 0 = usando POSIX TZ por defecto
 bool timeOk = false;
 
 int x_pos = 0;
@@ -84,6 +85,8 @@ SetupState setupState = SETUP_INIT;
 unsigned long setupMsgStart = 0;
 int scrollPos = 0;
 unsigned long lastScrollUpdate = 0;
+bool scrollPausing = false;
+unsigned long scrollPauseStart = 0;
 
 // ========== FUNCIONES DE PANTALLA SETUP ==========
 
@@ -116,44 +119,82 @@ void clearAndShowText(const char* line1, const char* line2 = nullptr, uint16_t c
   dma_display->flipDMABuffer();
 }
 
-void showScrollingText(const char* text, uint16_t color = 0xFFFF) {
-  if (millis() - lastScrollUpdate < 30) return;
+void resetScrollState() {
+  scrollPos = PANEL_RES_X * PANEL_CHAIN;
+  scrollPausing = false;
+}
+
+// Muestra texto con scroll. Devuelve true cuando se leyó entero + 3s de pausa.
+bool showScrollingText(const char* text, uint16_t color = 0xFFFF) {
+  int textW = strlen(text) * 6;
+  int screenW = PANEL_RES_X * PANEL_CHAIN;
+
+  // Si el texto cabe en pantalla, mostrar centrado y pausar
+  if (textW <= screenW) {
+    dma_display->fillScreen(0);
+    dma_display->setTextSize(1);
+    dma_display->setTextColor(color);
+    dma_display->setCursor((screenW - textW) / 2, 12);
+    dma_display->print(text);
+    dma_display->flipDMABuffer();
+    if (!scrollPausing) {
+      scrollPausing = true;
+      scrollPauseStart = millis();
+    }
+    return (millis() - scrollPauseStart >= 3000);
+  }
+
+  // Pausa tras scroll completo
+  if (scrollPausing) {
+    if (millis() - scrollPauseStart >= 3000) return true;
+    // Redibujar en posición final durante la pausa
+    dma_display->fillScreen(0);
+    dma_display->setTextSize(1);
+    dma_display->setTextColor(color);
+    dma_display->setCursor(scrollPos, 12);
+    dma_display->print(text);
+    dma_display->flipDMABuffer();
+    return false;
+  }
+
+  // Scroll normal
+  if (millis() - lastScrollUpdate < 30) return false;
   lastScrollUpdate = millis();
-  
+
   dma_display->fillScreen(0);
   dma_display->setTextSize(1);
   dma_display->setTextColor(color);
-  
-  int textW = strlen(text) * 6;
-  int screenW = PANEL_RES_X * PANEL_CHAIN;
-  
   dma_display->setCursor(scrollPos, 12);
   dma_display->print(text);
-  
-  scrollPos--;
-  if (scrollPos < -textW) {
-    scrollPos = screenW;
-  }
-  
   dma_display->flipDMABuffer();
+
+  scrollPos--;
+
+  // El texto se ha mostrado entero cuando su final llega al borde derecho
+  if (scrollPos + textW <= screenW) {
+    scrollPausing = true;
+    scrollPauseStart = millis();
+  }
+
+  return false;
 }
 
-void showRegisterMsg() {
-  const char* msg = "1. Registra en joseaveleira.es/IoT y obtén el QR";
+bool showRegisterMsg() {
+  const char* msg = "1. Registra en joseaveleira.es/IoT y obten el QR";
   uint16_t magenta = dma_display->color565(255, 100, 255);
-  showScrollingText(msg, magenta);
+  return showScrollingText(msg, magenta);
 }
 
-void showConnectWiFiMsg() {
+bool showConnectWiFiMsg() {
   const char* msg = "2. Conecta al WiFi: PixelClock-Setup";
   uint16_t yellow = dma_display->color565(255, 255, 0);
-  showScrollingText(msg, yellow);
+  return showScrollingText(msg, yellow);
 }
 
-void showScanQRMsg() {
+bool showScanQRMsg() {
   const char* msg = "3. Escanea el QR y configura tu WiFi";
   uint16_t cyan = dma_display->color565(0, 255, 255);
-  showScrollingText(msg, cyan);
+  return showScrollingText(msg, cyan);
 }
 
 void showConnectedMsg() {
@@ -201,6 +242,23 @@ void showConnectedWithProgress(float progress) {
 void showWaitingMsg() {
   uint16_t blue = dma_display->color565(100, 150, 255);
   clearAndShowText("Conectando...", nullptr, blue);
+}
+
+void showWifiConnectingMsg(int attempt, int maxAttempts) {
+  char line2[32];
+  snprintf(line2, sizeof(line2), "Intento %d/%d", attempt, maxAttempts);
+  uint16_t yellow = dma_display->color565(255, 200, 0);
+  clearAndShowText("WiFi...", line2, yellow);
+}
+
+void showMqttConnectingMsg() {
+  uint16_t blue = dma_display->color565(100, 180, 255);
+  clearAndShowText("Servidor...", nullptr, blue);
+}
+
+void showStabilizingMsg() {
+  uint16_t cyan = dma_display->color565(0, 220, 255);
+  clearAndShowText("Enlazando...", nullptr, cyan);
 }
 
 // ========== CALLBACKS MQTT ==========
@@ -357,14 +415,31 @@ void onMqttMessage(const char* topic, const char* payload) {
     }
   }
 
-  // Topic /weather: {"temp":8.4,"humidity":88,"isDay":true,"code":3,"condition":"Overcast","icon":"partly-cloudy",...}
+  // Topic /weather: {"temp":8.4,"humidity":88,"isDay":true,"icon":"partly-cloudy","utcOffset":3600,...}
   if (strstr(topic, "/weather") != nullptr) {
     if (doc.containsKey("temp") && doc.containsKey("icon") && doc.containsKey("isDay")) {
-      int temp = doc["temp"].as<int>();  // Convertir a entero
+      int temp = doc["temp"].as<int>();
       const char* icon = doc["icon"];
       bool isDay = doc["isDay"].as<bool>();
 
       updateWeather(temp, icon, isDay);
+    }
+
+    // Ajustar zona horaria si el servidor envía utcOffset (segundos desde UTC)
+    if (doc.containsKey("utcOffset")) {
+      long newOffset = doc["utcOffset"].as<long>();
+      if (newOffset != utcOffset_sec) {
+        utcOffset_sec = newOffset;
+        // Construir cadena POSIX: signo invertido (este=negativo en POSIX)
+        long h = newOffset / 3600;
+        long m = abs((newOffset % 3600) / 60);
+        char tz[24];
+        if (m > 0) snprintf(tz, sizeof(tz), "UTC%+ld:%02ld", -h, m);
+        else       snprintf(tz, sizeof(tz), "UTC%+ld", -h);
+        setenv("TZ", tz, 1);
+        tzset();
+        Serial.printf("[NTP] Zona horaria actualizada: %s (UTC%+ld)\n", tz, h);
+      }
     }
   }
 
@@ -425,59 +500,66 @@ void onConnectionChange(bool connected) {
 
 bool runSetupWithDisplay() {
   static unsigned long stateChangeTime = 0;
-  static unsigned long lastMsgSwitch = 0;
   static int currentMsg = 0;
-  
-  // Procesar IoTConnect
+
+  // Procesar IoTConnect (máquina de estados no bloqueante)
   IoTConnect.loop();
-  
+
+  IoTState state = IoTConnect.getState();
+
   // Si ya está listo, mostramos "CONECTADO!" y luego terminamos
-  if (IoTConnect.isReady()) {
+  if (state == IoTState::READY) {
     if (setupState != SETUP_CONNECTED && setupState != SETUP_DONE) {
       setupState = SETUP_CONNECTED;
       stateChangeTime = millis();
-      showConnectedMsg();
     }
-    
+
     if (setupState == SETUP_CONNECTED) {
-      // Mostrar "CONECTADO!" con barra de progreso durante 5 segundos
       unsigned long elapsed = millis() - stateChangeTime;
       float progress = (float)elapsed / 5000.0f;
       if (progress > 1.0f) progress = 1.0f;
-      
       showConnectedWithProgress(progress);
-      
       if (elapsed > 5000) {
         setupState = SETUP_DONE;
-        return true; // Setup completado
+        return true;
       }
-      return false; // Aún mostrando mensaje
+      return false;
     }
-    
     return true;
   }
-  
-  // Si está en modo configuración (portal cautivo)
-  if (IoTConnect.isConfigMode()) {
-    // Alternar mensajes cada 5 segundos
-    if (millis() - lastMsgSwitch > 5000) {
-      lastMsgSwitch = millis();
+
+  // Portal cautivo — rotar mensajes tras scroll completo + pausa
+  if (state == IoTState::PORTAL) {
+    bool msgDone = false;
+    if (currentMsg == 0) msgDone = showRegisterMsg();
+    else if (currentMsg == 1) msgDone = showConnectWiFiMsg();
+    else msgDone = showScanQRMsg();
+
+    if (msgDone) {
       currentMsg = (currentMsg + 1) % 3;
-      scrollPos = PANEL_RES_X * PANEL_CHAIN; // Reset scroll
+      resetScrollState();
     }
-    
-    if (currentMsg == 0) {
-      showRegisterMsg();
-    } else if (currentMsg == 1) {
-      showConnectWiFiMsg();
-    } else {
-      showScanQRMsg();
-    }
-    
     return false;
   }
-  
-  // Estado intermedio (conectando)
+
+  // Conectando WiFi — mostrar intento actual
+  if (state == IoTState::WIFI_CONNECTING) {
+    showWifiConnectingMsg(IoTConnect.getWifiRetry(), IoTConnect.getWifiMaxRetries());
+    return false;
+  }
+
+  // Conectando MQTT
+  if (state == IoTState::MQTT_CONNECTING) {
+    showMqttConnectingMsg();
+    return false;
+  }
+
+  // Estabilizando
+  if (state == IoTState::STABILIZING) {
+    showStabilizingMsg();
+    return false;
+  }
+
   showWaitingMsg();
   return false;
 }
@@ -533,8 +615,8 @@ void setup() {
   
   // La suscripción MQTT ya se hace en onConnectionChange(), no duplicar aquí
   
-  // Configurar NTP una vez conectado al WiFi
-  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov");
+  // Configurar NTP con zona horaria POSIX (gestiona verano/invierno automáticamente)
+  configTzTime(DEFAULT_TZ, "pool.ntp.org", "time.nist.gov");
   struct tm t;
   if (getLocalTime(&t, 3000)) {
     timeOk = true;
@@ -548,9 +630,8 @@ void setup() {
 }
 
 // Variables para detectar reconexión
-static unsigned long lastPortalMsgSwitch = 0;
 static int portalMsgIndex = 0;
-static bool wasInPortalMode = false;
+static bool wasDisconnected = false;
 
 // Función inteligente para elegir archivo (RAW vs GIF)
 String getSmartPath(String inputPath) {
@@ -577,39 +658,41 @@ void loop() {
   // Mantener IoTConnect activo
   IoTConnect.loop();
   
-  // Si vuelve al modo portal (pérdida de conexión), mostrar mensajes
-  if (IoTConnect.isConfigMode()) {
-    if (!wasInPortalMode) {
-      // Acaba de entrar en modo portal
-      wasInPortalMode = true;
+  // Si no está en READY, mostrar estado en pantalla
+  IoTState state = IoTConnect.getState();
+
+  if (state != IoTState::READY) {
+    if (!wasDisconnected) {
+      wasDisconnected = true;
       portalMsgIndex = 0;
-      lastPortalMsgSwitch = millis();
-      scrollPos = PANEL_RES_X * PANEL_CHAIN;
-      Serial.println("[MAIN] Entró en modo portal - mostrando instrucciones");
+      resetScrollState();
+      Serial.println("[MAIN] Desconectado - mostrando estado");
     }
-    
-    // Alternar mensajes cada 5 segundos
-    if (millis() - lastPortalMsgSwitch > 5000) {
-      lastPortalMsgSwitch = millis();
-      portalMsgIndex = (portalMsgIndex + 1) % 3;
-      scrollPos = PANEL_RES_X * PANEL_CHAIN;
+
+    if (state == IoTState::PORTAL) {
+      bool msgDone = false;
+      if (portalMsgIndex == 0) msgDone = showRegisterMsg();
+      else if (portalMsgIndex == 1) msgDone = showConnectWiFiMsg();
+      else msgDone = showScanQRMsg();
+
+      if (msgDone) {
+        portalMsgIndex = (portalMsgIndex + 1) % 3;
+        resetScrollState();
+      }
+    } else if (state == IoTState::WIFI_CONNECTING) {
+      showWifiConnectingMsg(IoTConnect.getWifiRetry(), IoTConnect.getWifiMaxRetries());
+    } else if (state == IoTState::MQTT_CONNECTING) {
+      showMqttConnectingMsg();
+    } else if (state == IoTState::STABILIZING) {
+      showStabilizingMsg();
     }
-    
-    if (portalMsgIndex == 0) {
-      showRegisterMsg();
-    } else if (portalMsgIndex == 1) {
-      showConnectWiFiMsg();
-    } else {
-      showScanQRMsg();
-    }
-    
-    return; // No ejecutar el resto del loop mientras esté en portal
+
+    return;
   }
-  
-  // Si salió del modo portal, resetear flag
-  if (wasInPortalMode && !IoTConnect.isConfigMode()) {
-    wasInPortalMode = false;
-    // Mostrar conectado brevemente
+
+  // Volvió a READY tras desconexión
+  if (wasDisconnected) {
+    wasDisconnected = false;
     showConnectedMsg();
     delay(2000);
     dma_display->clearScreen();
